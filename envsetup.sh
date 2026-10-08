@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# These tools are intended for interactive environments and were not designed
+# to work when checking unbound variables is disallowed.
+set +u
+
 # gettop is duplicated here and in shell_utils.mk, because it's difficult
 # to find shell_utils.make without it for all the novel ways this file can be
 # sourced.  Other common functions should only be in one place or the other.
@@ -54,8 +58,8 @@ function build_build_var_cache()
     local T=$(gettop)
     local one_true_awk=$T/prebuilts/build-tools/$(get_host_prebuilt_prefix)/bin/one-true-awk
     # Grep out the variable names from the script.
-    cached_vars=(`cat $T/build/envsetup.sh $T/vendor/lineage/build/envsetup.sh | tr '()' '  ' | $one_true_awk '{for(i=1;i<=NF;i++) if($i~/_get_build_var_cached/) print $(i+1)}' | sort -u | tr '\n' ' '`)
-    cached_abs_vars=(`cat $T/build/envsetup.sh $T/vendor/lineage/build/envsetup.sh | tr '()' '  ' | $one_true_awk '{for(i=1;i<=NF;i++) if($i~/_get_abs_build_var_cached/) print $(i+1)}' | sort -u | tr '\n' ' '`)
+    cached_vars=(`cat $T/build/envsetup.sh $T/vendor/lineage/build/envsetup.sh | tr '()' '  ' | $one_true_awk '{for(i=1;i<=NF;i++) if($i~/_get_build_var_cached/) print $(i+1)}' | grep -vE "^(print|COMMON_LUNCH_CHOICES)$" | sort -u | tr '\n' ' '`)
+    cached_abs_vars=(`cat $T/build/envsetup.sh $T/vendor/lineage/build/envsetup.sh | tr '()' '  ' | $one_true_awk '{for(i=1;i<=NF;i++) if($i~/_get_abs_build_var_cached/) print $(i+1)}' | grep -vE "^(print|COMMON_LUNCH_CHOICES)$" | sort -u | tr '\n' ' '`)
     # Call the build system to dump the "<val>=<value>" pairs as a shell script.
     build_dicts_script=`\builtin cd $T; build/soong/soong_ui.bash --dumpvars-mode \
                         --vars="${cached_vars[*]}" \
@@ -384,11 +388,9 @@ function addcompletions()
     if [ -z "$ZSH_VERSION" ]; then
         # Doesn't work in zsh.
         complete -o nospace -F _croot croot
-        # TODO(b/244559459): Support b autocompletion for zsh
         complete -F _bazel__complete -o nospace b
     fi
-    complete -F _lunch lunch
-    complete -F _lunch_completion lunch2
+    complete -F _lunch_completion lunch
 
     complete -F _complete_android_module_names pathmod
     complete -F _complete_android_module_names gomod
@@ -508,23 +510,6 @@ function _lunch_meat()
     if [[ -n "${CHECK_MU_CONFIG:-}" ]]; then
       check_mu_config
     fi
-}
-
-unset COMMON_LUNCH_CHOICES_CACHE
-# Tab completion for lunch.
-function _lunch()
-{
-    local cur prev opts
-    COMPREPLY=()
-    cur="${COMP_WORDS[COMP_CWORD]}"
-    prev="${COMP_WORDS[COMP_CWORD-1]}"
-
-    if [ -z "$COMMON_LUNCH_CHOICES_CACHE" ]; then
-        COMMON_LUNCH_CHOICES_CACHE=$(TARGET_BUILD_APPS= _get_build_var_cached COMMON_LUNCH_CHOICES)
-    fi
-
-    COMPREPLY=( $(compgen -W "${COMMON_LUNCH_CHOICES_CACHE}" -- ${cur}) )
-    return 0
 }
 
 function _lunch_usage()
@@ -671,6 +656,17 @@ function leftovers()
 
     local product release variant
     IFS=" " read -r product release variant < "$dot_leftovers"
+
+    # Check if the current environment matches the saved leftovers. Also check if TARGET_BUILD_APPS
+    # is empty because lunch unsets it, while tapas and banchan set it. This ensures that if tapas
+    # or banchan command was run after lunch, that it does not unset it.
+    if [[ "$product" == "$TARGET_PRODUCT" ]] &&
+       [[ "$release" == "$TARGET_RELEASE" ]] &&
+       [[ "$variant" == "$TARGET_BUILD_VARIANT" ]] &&
+       [[ -z "$TARGET_BUILD_APPS" ]]; then
+        echo "$INFO: Already lunched: ${style_bold}$product $release $variant${style_reset}"
+        return
+    fi
 
     echo "$INFO: Loading previous lunch: ${style_bold}$product $release $variant${style_reset}"
     lunch $product $release $variant
@@ -917,6 +913,16 @@ function fastboot() {
     run_tool_with_logging "FASTBOOT" $FASTBOOT "${@}"
 }
 
+function flashall()
+{
+    local T=$(gettop)
+    if [ "$T" ]; then
+        "$T/vendor/google/tools/flashall" "$@"
+    else
+        echo "Couldn't locate the top of the tree.  Try setting TOP."
+    fi
+}
+
 # communicate with a running device or emulator, set up necessary state,
 # and run the hat command.
 function runhat()
@@ -1096,29 +1102,46 @@ function validate_current_shell() {
 function source_vendorsetup() {
     unset VENDOR_PYTHONPATH
     local T="$(gettop)"
-    allowed=
-    for f in $(cd "$T" && find -L device vendor product -maxdepth 4 -name 'allowed-vendorsetup_sh-files' 2>/dev/null | sort); do
-        if [ -n "$allowed" ]; then
-            echo "More than one 'allowed_vendorsetup_sh-files' file found, not including any vendorsetup.sh files:"
-            echo "  $allowed"
-            echo "  $f"
-            return
-        fi
-        allowed="$T/$f"
-    done
+    local allowed=
+    local vendorsetups=()
 
-    allowed_files=
-    [ -n "$allowed" ] && allowed_files=$(cat "$allowed")
-    for dir in device vendor product; do
-        for f in $(cd "$T" && test -d $dir && \
-            find -L $dir -maxdepth 4 -name 'vendorsetup.sh' 2>/dev/null | sort); do
-
-            if [[ -z "$allowed" || "$allowed_files" =~ $f ]]; then
-                echo "including $f"; . "$T/$f"
-            else
-                echo "ignoring $f, not in $allowed"
+    # Find all relevant files in a single traversal to improve performance.
+    while IFS= read -r f; do
+        if [[ -z "$f" ]]; then continue; fi
+        if [[ "$f" == *allowed-vendorsetup_sh-files ]]; then
+            if [ -n "$allowed" ]; then
+                echo "More than one 'allowed_vendorsetup_sh-files' file found, not including any vendorsetup.sh files:"
+                echo "  $allowed"
+                echo "  $T/$f"
+                return
             fi
-        done
+            allowed="$T/$f"
+        elif [[ "$f" == *vendorsetup.sh ]]; then
+            vendorsetups+=("$f")
+        fi
+    done < <(cd "$T" && find -L device vendor product -maxdepth 4 \( -name 'allowed-vendorsetup_sh-files' -o -name 'vendorsetup.sh' \) 2>/dev/null | sort)
+
+    local allowed_files=()
+    if [ -n "$allowed" ]; then
+        allowed_files=($(cat "$allowed"))
+    fi
+
+    for f in "${vendorsetups[@]}"; do
+        if [ -z "$allowed" ]; then
+            echo "including $f"
+            . "$T/$f"
+        else
+            local found=
+            for a in "${allowed_files[@]}"; do
+                if [[ "$T/$f" == *"$a"* ]]; then
+                    echo "including $f"
+                    . "$T/$f"
+                    found=y
+                    break
+                fi
+            done
+            [[ -n ${found} ]] || echo "ignoring $f, not in $allowed"
+        fi
     done
 
     setup_cog_env_if_needed
@@ -1220,58 +1243,6 @@ addcompletions
 if [[ "$USE_LEFTOVERS" -eq 1 ]]; then
   leftovers
 fi
-
-function setup_ccache() {
-    # check and set ccache path on envsetup
-    if [ -z "${CCACHE_EXEC}" ]; then
-        if command -v ccache &>/dev/null; then
-            export USE_CCACHE=1
-            export CCACHE_EXEC=$(command -v ccache)
-            [ -z "${CCACHE_DIR}" ] && export CCACHE_DIR="$HOME/.ccache"
-            echo "ccache directory found, CCACHE_DIR set to: $CCACHE_DIR" >&2
-
-            CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-40G}"
-            DIRECT_MODE="${DIRECT_MODE:-false}"
-
-            $CCACHE_EXEC -o compression=true -o direct_mode="${DIRECT_MODE}" -M "${CCACHE_MAXSIZE}" \
-                && echo "ccache enabled, CCACHE_EXEC set to: $CCACHE_EXEC, CCACHE_MAXSIZE set to: $CCACHE_MAXSIZE, direct_mode set to: $DIRECT_MODE" >&2 \
-                || echo "Warning: Could not set cache size limit. Please check ccache configuration." >&2
-
-            if [ -d "$CCACHE_DIR" ]; then
-                CURRENT_CCACHE_SIZE_BYTES=$(du -sb "$CCACHE_DIR" 2>/dev/null | awk '{print $1}')
-                CURRENT_CCACHE_SIZE_GB=$(echo "$CURRENT_CCACHE_SIZE_BYTES" | awk '{printf "%.2f\n", $1 / 1000 / 1000 / 1000}')
-
-                if [ -n "$CURRENT_CCACHE_SIZE_GB" ]; then
-                    echo "Current ccache size is: ${CURRENT_CCACHE_SIZE_GB} GB" >&2
-                else
-                    echo "No cached files in ccache." >&2
-                fi
-            else
-                echo "Warning: ccache directory does not exist: $CCACHE_DIR" >&2
-            fi
-        else
-            echo "Error: ccache not found. Please install ccache." >&2
-        fi
-    fi
-}
-
-function remove_broken_build_tools() {
-    # Check for files matching each pattern and delete if they exist
-    if ls prebuilts/build-tools/path/*/date >/dev/null 2>&1; then
-        for file in prebuilts/build-tools/path/*/date; do
-            rm -f "$file"  # Remove each date file if it exists
-        done
-    fi
-
-    if ls prebuilts/build-tools/path/*/tar >/dev/null 2>&1; then
-        for file in prebuilts/build-tools/path/*/tar; do
-            rm -f "$file"  # Remove each tar file if it exists
-        done
-    fi
-}
-
-setup_ccache
-remove_broken_build_tools
 
 export ANDROID_BUILD_TOP=$(gettop)
 
